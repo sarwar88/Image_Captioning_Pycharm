@@ -1,0 +1,94 @@
+from io import BytesIO
+
+import joblib
+import numpy as np
+import tensorflow as tf
+from PIL import Image
+from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Load pre-trained models and required data at startup
+print("Loading models and vocabulary...")
+resnet_model = tf.keras.applications.ResNet50(include_top=False, weights="imagenet", pooling="avg")
+words_to_indices = joblib.load("words_to_indices.joblib")
+indices_to_words = joblib.load("indices_to_words.joblib")
+lstm_model = joblib.load("image_captioning_model.joblib")
+max_length = 40
+print("Models and vocabulary loaded.")
+
+@app.post("/generate-caption/")
+async def generate_caption(file: UploadFile, method: str = Form("greedy")):
+    """
+    Generate a caption for the uploaded image using the specified method (greedy or beam search).
+    """
+    try:
+        # Validate file type
+        if file.content_type not in ["image/jpeg", "image/png"]:
+            raise HTTPException(status_code=400, detail="Invalid file format. Upload a JPG or PNG image.")
+
+        # Read and preprocess the image
+        img = Image.open(BytesIO(await file.read())).convert("RGB")
+        img = img.resize((224, 224))  # Resize to ResNet50 input size
+        img_array = img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0)
+        img_array = preprocess_input(img_array)
+
+        # Extract features using ResNet50
+        photo_features = resnet_model.predict(img_array).squeeze()
+
+        # Generate caption based on the method
+        if method == "greedy":
+            caption = greedy_search(photo_features, lstm_model, words_to_indices, indices_to_words, max_length)
+        elif method == "beam":
+            caption = beam_search(photo_features, lstm_model, words_to_indices, indices_to_words, max_length, k=3)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid method. Choose 'greedy' or 'beam'.")
+
+        return JSONResponse(content={"caption": " ".join(caption)})
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Helper functions
+def greedy_search(photo_features, lstm_model, words_to_indices, indices_to_words, max_length):
+    """Generate a caption using greedy search."""
+    in_text = "<start>"
+    for _ in range(max_length):
+        sequence = [words_to_indices[word] for word in in_text.split() if word in words_to_indices]
+        sequence = pad_sequences([sequence], maxlen=max_length, padding="post")
+        y_pred = lstm_model.predict([np.expand_dims(photo_features, axis=0), sequence], verbose=0)
+        y_pred = np.argmax(y_pred[0])
+        word = indices_to_words.get(y_pred, "<end>")
+        if word == "<end>":
+            break
+        in_text += " " + word
+    return in_text.split()[1:]
+
+def beam_search(photo_features, lstm_model, words_to_indices, indices_to_words, max_length, k=3):
+    """Generate a caption using beam search."""
+    sequences = [("<start>", 1.0)]
+    for _ in range(max_length):
+        all_candidates = []
+        for seq, score in sequences:
+            sequence = [words_to_indices[word] for word in seq.split() if word in words_to_indices]
+            sequence = pad_sequences([sequence], maxlen=max_length, padding="post")
+            y_pred = lstm_model.predict([np.expand_dims(photo_features, axis=0), sequence], verbose=0)[0]
+            top_k_indices = np.argsort(y_pred)[-k:]
+            for idx in top_k_indices:
+                word = indices_to_words.get(idx, "<end>")
+                candidate = (seq + " " + word, score * y_pred[idx])
+                all_candidates.append(candidate)
+        sequences = sorted(all_candidates, key=lambda x: x[1], reverse=True)[:k]
+    return sequences[0][0].split()[1:]
+
+# Instructions to run the application
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting FastAPI server...")
+    uvicorn.run(app, host="127.0.0.1", port=8000)

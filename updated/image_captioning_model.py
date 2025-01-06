@@ -171,7 +171,7 @@ class ImageCaptioning:
 
     def save_model(self):
         """Save the trained model."""
-        joblib.dump(self.model, "image_captioning_model.joblib")
+        joblib.dump(self.model, "../sobject/image_captioning_model.joblib")
         print("Model saved as image_captioning_model.joblib")
 
     def greedy_search(self, photo):
